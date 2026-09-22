@@ -62,9 +62,43 @@ jobs:
           pnpm -v
           git rev-parse HEAD
 
+      # 修复：apps/desktop/package.json 的 dependencies 只声明了 4 项
+      # （electron-updater / semver / ws / @deepseek-ai/dsh-api-gateway），
+      # 而 electron-builder 收集依赖时只走 dependencies、不走 peerDependencies，
+      # 且 lib/main.js 里的 require("node-addon-require-builtin") 属未声明的幽灵依赖。
+      # 结果是打出的外层 app.asar/node_modules 缺 9 个包，安装后启动即
+      # ERR_MODULE_NOT_FOUND（2026-09-22 run 35722185948 产物实测）。
+      # 这里只在 CI 运行期内临时补齐，不提交 package.json / pnpm-lock.yaml，
+      # 以免 lockfile 不同步而波及仓库其他流水线的 --frozen-lockfile。
+      - name: 补齐桌面端打包所需依赖（仅本次运行内生效）
+        shell: pwsh
+        run: |
+          $js = @'
+          import fs from 'node:fs';
+          const p = 'apps/desktop/package.json';
+          const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+          Object.assign(j.dependencies, {
+            'node-addon-require-builtin': '0.1.6',
+            '@deepseek-ai/cordis': 'workspace:^',
+            '@deepseek-ai/cordis-plugin-loader': 'workspace:^',
+            '@deepseek-ai/dsh-client-connection': 'workspace:^',
+            '@deepseek-ai/dsh-credentials': 'workspace:^',
+            '@deepseek-ai/dsh-invariants': 'workspace:^',
+            '@deepseek-ai/dsh-scope': 'workspace:^',
+            '@deepseek-ai/dsh-util-crypto': 'workspace:^',
+            zod: '^4.6.5',
+          });
+          fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+          console.log('desktop dependencies (' + Object.keys(j.dependencies).length + '): ' + Object.keys(j.dependencies).sort().join(', '));
+          '@
+          $tmpdir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+          $js | Set-Content -Path "$tmpdir\patch-desktop-deps.mjs" -Encoding utf8NoBOM
+          node "$tmpdir\patch-desktop-deps.mjs"
+
+      # 上一步改了 package.json，lockfile 需要重新解析，故放开 frozen-lockfile。
       - name: 安装依赖
         shell: pwsh
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --no-frozen-lockfile
 
       # 打包脚本 scripts/package-target.ts 在「被 tsx 加载」阶段就静态 import 了
       # @deepseek-ai/node-addon-system/lib/flock.js 等工作区库产物；这些 lib 不在仓库里，
@@ -100,6 +134,92 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: pnpm run package:desktop:win:x64:unsigned
+
+      # 校验外层 app.asar 的依赖是否齐全：electron-builder 只按 dependencies 收包，
+      # 一旦 apps/desktop 的声明再有遗漏，这里会明确报出缺哪些包，而不是等用户装上才发现。
+      # 设为 continue-on-error，只作诊断信号，不阻断产物产出与上传。
+      - name: 校验 app.asar 外层依赖完整性（诊断）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $script = @'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import Module from 'node:module';
+          const RES = 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/win-unpacked/resources';
+          const ASAR = path.join(RES, 'app.asar');
+          const UNPACKED = path.join(RES, 'app.asar.unpacked');
+          if (!fs.existsSync(ASAR)) { console.log('app.asar 不存在，跳过校验'); process.exit(0); }
+          const fd = fs.openSync(ASAR, 'r');
+          const sb = Buffer.alloc(8); fs.readSync(fd, sb, 0, 8, 0);
+          const headerSize = sb.readUInt32LE(4);
+          const hb = Buffer.alloc(headerSize); fs.readSync(fd, hb, 0, headerSize, 8);
+          const raw = hb.toString('utf8');
+          const tree = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+          const dataStart = 8 + headerSize;
+          const nodeAt = (rel) => { let c = tree; for (const x of rel) { if (!c || !c.files || !c.files[x]) return null; c = c.files[x]; } return c; };
+          const readAt = (rel) => {
+            const n = nodeAt(rel);
+            if (!n || n.files) return null;
+            if (n.offset !== undefined) { const b = Buffer.alloc(n.size); fs.readSync(fd, b, 0, n.size, dataStart + parseInt(n.offset, 10)); return b.toString('utf8'); }
+            const d = path.join(UNPACKED, ...rel);
+            return fs.existsSync(d) ? fs.readFileSync(d, 'utf8') : null;
+          };
+          const builtins = new Set(Module.builtinModules);
+          const OPTIONAL_OK = new Set(['bufferutil', 'utf-8-validate', 'supports-color', 'electron']);
+          const existsAt = (abs) => {
+            const n = abs.replace(/\//g, '\\');
+            if (n.toLowerCase().startsWith(ASAR.toLowerCase() + '\\')) return !!nodeAt(n.slice(ASAR.length + 1).split('\\'));
+            if (n.toLowerCase().startsWith(UNPACKED.toLowerCase() + '\\')) return fs.existsSync(n);
+            return fs.existsSync(n);
+          };
+          const resolveFrom = (startDir, pkg) => {
+            if (builtins.has(pkg) || builtins.has(pkg.replace(/^node:/, '')) || OPTIONAL_OK.has(pkg)) return 'skip';
+            const segs = pkg.split('/');
+            let dir = startDir;
+            for (;;) {
+              if (path.basename(dir).toLowerCase() !== 'node_modules') {
+                if (existsAt(path.join(dir, 'node_modules', ...segs))) return 'ok';
+              }
+              const parent = path.dirname(dir);
+              if (parent === dir) return null;
+              dir = parent;
+            }
+          };
+          const RE = /(?:^|[^\w$])(?:import\s*\(|require\s*\(|from\s+)['"]([^'"]+)['"]/g;
+          const missing = new Map();
+          let files = 0;
+          const walk = (dirAbs, relParts) => {
+            const n = nodeAt(relParts);
+            if (!n || !n.files) return;
+            for (const k of Object.keys(n.files)) {
+              const c = n.files[k];
+              if (c.files) { walk(dirAbs + '/' + k, relParts.concat(k)); continue; }
+              if (!/\.(js|mjs|cjs)$/.test(k)) continue;
+              const txt = readAt(relParts.concat(k));
+              if (!txt) continue;
+              files++;
+              let m; RE.lastIndex = 0;
+              while ((m = RE.exec(txt))) {
+                const s = m[1];
+                if (s[0] === '.' || s[0] === '/' || s.indexOf('data:') === 0) continue;
+                const base = s[0] === '@' ? s.split('/').slice(0, 2).join('/') : s.split('/')[0];
+                if (!base || OPTIONAL_OK.has(base)) continue;
+                if (!resolveFrom(dirAbs, base) && !missing.has(base)) missing.set(base, relParts.concat(k).join('/'));
+              }
+            }
+          };
+          for (const d of ['lib', 'renderer']) {
+            if (nodeAt([d])) walk(ASAR + '\\' + d, [d]);
+          }
+          fs.closeSync(fd);
+          console.log('扫描 ' + files + ' 个文件，缺失 ' + missing.size + ' 个包');
+          for (const [k, v] of missing) console.log('  MISSING ' + k + '  <- ' + v);
+          if (missing.size > 0) process.exitCode = 3;
+          '@
+          $tmpdir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+          $script | Set-Content -Path "$tmpdir\check-asar-deps.mjs" -Encoding utf8NoBOM
+          node "$tmpdir\check-asar-deps.mjs"
 
       - name: 校验安装包是否生成
         shell: pwsh
