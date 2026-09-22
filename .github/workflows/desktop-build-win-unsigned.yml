@@ -225,7 +225,7 @@ jobs:
         shell: pwsh
         run: |
           $artifacts = 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
-          $exe = Get-ChildItem $artifacts -Filter '*-win-x64.exe' -ErrorAction SilentlyContinue |
+          $exe = Get-ChildItem $artifacts -Filter '*-win-x64*.exe' -ErrorAction SilentlyContinue |
             Where-Object { $_.Length -gt 50MB }
           if (-not $exe) { throw "desktop package: no installer produced under $artifacts" }
           $exe | Select-Object @{n='MB';e={[math]::Round($_.Length/1MB,1)}}, Name | Format-Table -AutoSize
