@@ -1,0 +1,95 @@
+name: desktop-win-unsigned
+
+# 手动触发的桌面端（Windows x64）未签名打包流水线。
+#
+# 背景（事实，来自 apps/desktop/README.zh.md 与 apps/desktop/package.json）：
+#   - 上游仓库的 .github/workflows 里没有桌面流水线，只能 fork 后自建。
+#   - 正式 Windows 签名需要 SafeNet 硬件令牌 + EV 证书（.env.windows 的
+#     DSH_DESKTOP_WINDOWS_CERT_FILE / SIGNTOOL / KEY_CONTAINER / TOKEN_PIN），
+#     托管 runner 无法完成，所以这里固定走 --unsigned 分支。
+#   - --unsigned 只支持 win-x64，且不能与 --prepare-only 同时使用；它会跳过
+#     primary-runtime 签名，产物落在 .desktop-build/targets/win-x64/unsigned-artifacts/。
+#   - 未签名产物可直接运行/安装，但会有 SmartScreen 警告，且不能用于正式发布上传。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的 git ref（tag / 分支 / sha）'
+        required: true
+        default: 'dsh-v0.1.7-alpha.1'
+
+concurrency:
+  group: desktop-win-unsigned
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    steps:
+      - name: 报告初始磁盘
+        shell: pwsh
+        run: Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+
+      - name: 释放磁盘空间（移除 runner 上用不到的 Android / .NET SDK）
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          foreach ($p in @("$env:ProgramFiles\Android", "${env:ProgramFiles(x86)}\Android", "$env:ProgramFiles\dotnet", "$env:ProgramFiles\Microsoft SDKs")) {
+            if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "removed $p" }
+          }
+          Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 工具链版本
+        shell: pwsh
+        run: |
+          node -v
+          pnpm -v
+          git rev-parse HEAD
+
+      - name: 安装依赖
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+
+      - name: 打包桌面端（Windows x64 / 未签名 NSIS）
+        shell: pwsh
+        run: pnpm run package:desktop:win:x64:unsigned
+
+      - name: 列出产物（便于诊断）
+        if: always()
+        shell: pwsh
+        run: |
+          $root = 'apps/desktop/.desktop-build'
+          if (Test-Path $root) {
+            Get-ChildItem $root -Recurse -File |
+              Sort-Object Length -Descending |
+              Select-Object -First 25 @{n='MB';e={[math]::Round($_.Length/1MB,1)}}, FullName |
+              Format-Table -AutoSize
+          } else { Write-Host 'no .desktop-build directory' }
+          Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dsh-desktop-win-x64-unsigned
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/**
+            apps/desktop/.desktop-build/targets/win-x64/artifacts/**
+            apps/desktop/.desktop-build/packaging-runs/**
