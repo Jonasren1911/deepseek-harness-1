@@ -75,6 +75,23 @@ jobs:
           pnpm --dir native/system run build:ts
           pnpm run build:lib
 
+      # 打包脚本强制要求 apps/desktop/.env.windows 存在（连 --unsigned 也要求，
+      # 见 scripts/desktop-package-environment.mjs）。未签名路径只校验：
+      # 应用 ID、npm registry、策略环境（选定 deployment 的 HTTPS origin）、Windows 签名缓存并发数。
+      # 这里选 production 策略：authentication=anonymous，且不允许配置 allowedAuthOrigins。
+      - name: 写入打包所需的 .env.windows
+        shell: pwsh
+        run: |
+          $envFile = 'apps/desktop/.env.windows'
+          @'
+DSH_DESKTOP_APP_ID=com.deepseek.harness
+DSH_DESKTOP_AUTO_UPDATE_ENV=production
+DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://download.deepseek.com
+DOWNLOAD_PROD_ORIGIN=https://download.deepseek.com
+DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4
+'@ | Set-Content -Path $envFile -Encoding utf8
+          Get-Content $envFile
+
       - name: 打包桌面端（Windows x64 / 未签名 NSIS）
         shell: pwsh
         run: pnpm run package:desktop:win:x64:unsigned
