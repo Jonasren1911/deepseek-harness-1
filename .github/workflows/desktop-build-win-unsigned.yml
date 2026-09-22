@@ -5,7 +5,7 @@ name: desktop-win-unsigned
 # 背景（事实，来自 apps/desktop/README.zh.md 与 apps/desktop/package.json）：
 #   - 上游仓库的 .github/workflows 里没有桌面流水线，只能 fork 后自建。
 #   - 正式 Windows 签名需要 SafeNet 硬件令牌 + EV 证书（.env.windows 的
-#     DSH_DESKTOP_WINDOWS_CERT_FILE / SIGNTOOL / KEY_CONTAINER / TOKEN_PIN），
+#     DSH_DESKTOP_WINDOWS_CER_FILE / SIGNTOOL / KEY_CONTAINER / TOKEN_PIN），
 #     托管 runner 无法完成，所以这里固定走 --unsigned 分支。
 #   - --unsigned 只支持 win-x64，且不能与 --prepare-only 同时使用；它会跳过
 #     primary-runtime 签名，产物落在 .desktop-build/targets/win-x64/unsigned-artifacts/。
@@ -82,15 +82,15 @@ jobs:
       - name: 写入打包所需的 .env.windows
         shell: pwsh
         run: |
-          $envFile = 'apps/desktop/.env.windows'
-          @'
-DSH_DESKTOP_APP_ID=com.deepseek.harness
-DSH_DESKTOP_AUTO_UPDATE_ENV=production
-DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://download.deepseek.com
-DOWNLOAD_PROD_ORIGIN=https://download.deepseek.com
-DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4
-'@ | Set-Content -Path $envFile -Encoding utf8
-          Get-Content $envFile
+          $lines = @(
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness',
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production',
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://download.deepseek.com',
+            'DOWNLOAD_PROD_ORIGIN=https://download.deepseek.com',
+            'DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4'
+          )
+          Set-Content -Path 'apps/desktop/.env.windows' -Value $lines -Encoding utf8
+          Get-Content 'apps/desktop/.env.windows'
 
       - name: 打包桌面端（Windows x64 / 未签名 NSIS）
         shell: pwsh
